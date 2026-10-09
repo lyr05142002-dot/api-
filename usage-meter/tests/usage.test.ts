@@ -224,6 +224,37 @@ describe('in a session', () => {
     }
   })
 
+  test('the strip above the input box shows the limits at a glance, and warns near the cap', async ($, on) => {
+    on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Text' as const, props: {}, children: ['survey'] }))
+    const s = session($, on)
+    const BAND = {
+      component: 'AbovePrompt' as const,
+      requestId: 'band',
+      props: { hasSurvey: false, isWorking: false, maxRows: 6, bodyColumns: 100, scroll: { offset: 0, bodyRows: 6 }, view: {} },
+    }
+    await s.start()
+    await s.measure(61, 10)
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const ui = await $.ui.mount({ plugin: 'usage-meter', surface, ...BAND })
+      expect(await ui.find({ type: 'Text', text: '5 小时' })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: '61%' })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: '4 小时 0 分后重置' })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: '本周' })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: '上下文' })).toBeDefined()
+      await ui.unmount()
+    }
+    await s.measure(88, 12)
+    const ui = await $.ui.mount({ plugin: 'usage-meter', surface: 'desktop', ...BAND })
+    expect(await ui.find({ type: 'Text', text: '⚠ 5 小时' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '88%' })).toBeDefined()
+    await ui.unmount()
+    // A survey keeps the band: the engine draws its own there.
+    const survey = await $.ui.mount({ plugin: 'usage-meter', surface: 'desktop', ...BAND, props: { ...BAND.props, hasSurvey: true } })
+    expect(await survey.find({ type: 'Text', text: '5 小时' })).toBeUndefined()
+    expect(await survey.find({ type: 'Text', text: 'survey' })).toBeDefined()
+    await survey.unmount()
+  })
+
   test('points another session already claimed are not claimed again', async ($, on) => {
     // Another session read 61% a moment ago; this one last saw nothing.
     const s = session($, on, { last: { t: T0, five: { kind: 'five_hour', pct: 61, resetsAt: RESETS } } })

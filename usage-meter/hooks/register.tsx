@@ -382,6 +382,61 @@ export const register: Register = on => {
 
   // ---------------------------------------------------------------- drawing
 
+  // The strip right above the input box: always in view, one glance.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+    const els = $.ui.resolve(e)
+    const { Box, Text } = els
+    const Svg = 'Svg' in els ? els.Svg : null
+    await read($, nowA) // redraws every minute, for the countdowns
+    const now = await $.clock.now()
+    const live = await read($, liveA)
+    const current = await read($, currentA)
+
+    const tone = (pct: number) => (pct >= 95 ? 'error' : pct >= 80 ? 'warning' : undefined)
+    const bar = (pct: number, isLimit: boolean, alt: string) =>
+      Svg ? (
+        <Svg source={meterSvg(pct, isLimit, 96)} alt={alt} width={96} height={8} />
+      ) : (
+        <Text color={isLimit ? tone(pct) : undefined} dimColor={!isLimit}>
+          {meterText(pct, 10)}
+        </Text>
+      )
+    const item = (key: string, label: string, pct: number, isLimit: boolean, note: string) => (
+      <Box key={key} flexDirection="row" gap={1} alignItems="center">
+        <Text dimColor>{label}</Text>
+        {bar(pct, isLimit, `${label} ${fmtPct(pct)}`)}
+        <Text bold color={isLimit ? tone(pct) : undefined}>
+          {fmtPct(pct)}
+        </Text>
+        {note !== '' && <Text dimColor>{note}</Text>}
+      </Box>
+    )
+
+    const five = live.limits.find(l => l.kind === 'five_hour')
+    const seven = live.limits.find(l => l.kind === 'seven_day')
+    const items = []
+    if (five) {
+      const pct = currentPct(five, now)
+      items.push(item('band-five', (pct >= 95 ? '⛔ ' : pct >= 80 ? '⚠ ' : '') + '5 小时', pct, true, fmtReset(five.resetsAt, now)))
+    }
+    if (seven) items.push(item('band-seven', '本周', currentPct(seven, now), true, fmtReset(seven.resetsAt, now)))
+    if (live.ctxPct !== null) items.push(item('band-ctx', '上下文', live.ctxPct, false, ''))
+    if (items.length === 0) return next(e)
+
+    return (
+      <Box flexDirection="row" flexWrap="wrap" columnGap={3} rowGap={0}>
+        {items}
+        {current && (
+          <Text dimColor>
+            本轮 {fmtTok(totalTok(current))} tokens{current.p5 >= 0.05 ? ` · +${fmtPct(current.p5)}` : ''}
+          </Text>
+        )}
+      </Box>
+    )
+  })
+
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text, Button } = els
