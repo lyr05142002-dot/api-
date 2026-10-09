@@ -1,6 +1,6 @@
 {
   "name": "usage-meter",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Claude 用量面板：5 小时/每周限额、上下文窗口、每时刻的消耗曲线，以及消耗花在了哪里",
   "author": {
     "name": "lyr05142002-dot"

@@ -371,8 +371,6 @@ export const register: Register = on => {
     // The model it will run on: the person may have switched since the last turn.
     currentModel = await $.session.model().catch(() => currentModel)
     const adv = await adviseDraft($, e.text, true).catch(() => null)
-    // For the desktop widget, which reads this store to show the latest advice.
-    if (adv) void $.store.set('advice', { tier: adv.tier, note: adv.note, fits: adv.fits, t: now }).catch(() => undefined)
     const turn = newTurn(`${sid}:${e.turnId}`, sid, proj, text, now)
     await serial(() => update($, currentA, () => (adv ? { ...turn, adv: adv.tier } : turn)))
     return next(e)
