@@ -1,0 +1,16 @@
+{
+  "name": "lyr-api",
+  "owner": {
+    "name": "lyr05142002-dot"
+  },
+  "metadata": {
+    "description": "lyr05142002-dot 的 Claude Code 插件"
+  },
+  "plugins": [
+    {
+      "name": "usage-meter",
+      "source": "./usage-meter",
+      "description": "Claude 用量面板：5 小时/每周限额、上下文窗口、每时刻的消耗曲线，以及消耗花在了哪里"
+    }
+  ]
+}
