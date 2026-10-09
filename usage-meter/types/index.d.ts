@@ -60,6 +60,9 @@ export type UsageMeterLive = {
 /** One row of the /context breakdown. */
 export type UsageMeterCtxCat = { name: string; tokens: number; kind: string }
 
+/** The model advised for the prompt being typed. */
+export type UsageMeterAdvice = { tier: string; reasons: string[]; note: string; fits: boolean }
+
 export type UsageMeterTab = 'now' | 'time' | 'where' | 'turns'
 export type UsageMeterRange = '5h' | '24h' | '7d'
 export type UsageMeterView = { tab: UsageMeterTab; range: UsageMeterRange }
@@ -74,6 +77,7 @@ declare module 'claude-code' {
       turns: UsageMeterTurn[]
       current: UsageMeterTurn | null
       ctxCats: UsageMeterCtxCat[] | null
+      advice: UsageMeterAdvice | null
       view: UsageMeterView
       now: number
     }

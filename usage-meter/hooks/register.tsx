@@ -10,6 +10,7 @@ import type {
   UsageMeterTab as Tab,
   UsageMeterTurn as Turn,
 } from '../types'
+import { TIER_INFO, type Project, type Tier, advise } from './advisor'
 import { burnChartSvg, levels, limitsChartSvg, meterSvg, meterText, sparkText } from './charts'
 import {
   KEEP_MS,
@@ -62,6 +63,7 @@ const currentA = atom({ plugin: 'usage-meter', key: 'current' } as const, null)
 const ctxCatsA = atom({ plugin: 'usage-meter', key: 'ctxCats' } as const, null)
 const viewA = atom({ plugin: 'usage-meter', key: 'view' } as const, { tab: 'now', range: '5h' })
 const nowA = atom({ plugin: 'usage-meter', key: 'now' } as const, 0)
+const adviceA = atom({ plugin: 'usage-meter', key: 'advice' } as const, null)
 
 const asArray = <T,>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : [])
 const totalTok = (t: Turn) => t.tok.i + t.tok.cw + t.tok.cr + t.tok.o
@@ -75,6 +77,9 @@ const pending = new Map<string, Pending[]>()
 const unsettled = new Set<string>()
 let usdAtStart: number | null = null
 const warned = new Set<string>()
+/** The main loop's model, and the project's size once counted. */
+let currentModel = ''
+let project: Project | null = null
 
 /**
  * How long before the work being counted the previous reading may have been
@@ -281,6 +286,34 @@ async function measure($: EngineInterface, e: SessionMeasureInput): Promise<void
   }
 }
 
+/** Counts the project's files: git's list where there is one, else the top folder. */
+async function sizeProject($: EngineInterface): Promise<void> {
+  const CODE = /\.(ts|tsx|js|jsx|mjs|py|go|rs|java|kt|cs|cpp|cc|c|h|hpp|rb|php|swift|scala|vue|svelte|sh|lua|dart|sql)$/i
+  const git = await $.process.run(['git', 'ls-files'], { timeoutMs: 5000 }).catch(() => null)
+  if (git && git.exitCode === 0) {
+    const files = git.stdout.split('\n').filter(Boolean)
+    project = { files: files.length, codeFiles: files.filter(f => CODE.test(f)).length }
+    return
+  }
+  const top = await $.fs.list('.').catch(() => [])
+  project = { files: top.length, codeFiles: top.filter(f => f.kind === 'file' && CODE.test(f.name)).length }
+}
+
+/** Advises a model for the draft in the box; writes only when the advice changed. */
+async function adviseDraft($: EngineInterface, text: string): Promise<void> {
+  const live = await read($, liveA)
+  const five = live.limits.find(l => l.kind === 'five_hour')
+  const next = advise({
+    text,
+    project,
+    current: currentModel,
+    fivePct: five ? currentPct(five, await $.clock.now()) : null,
+    ctxTokens: live.ctxTokens,
+  })
+  const was = await read($, adviceA)
+  if (JSON.stringify(was) !== JSON.stringify(next)) await update($, adviceA, () => next)
+}
+
 async function start($: EngineInterface, cwd: string): Promise<void> {
   sid = (await $.session.id()).slice(0, 8)
   proj = cwd.split(/[\\/]/).filter(Boolean).pop() ?? cwd
@@ -309,6 +342,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await start($, e.cwd)
+    currentModel = await $.session.model().catch(() => '')
+    void sizeProject($).catch(() => undefined)
     await $.command.register({ name: 'usage-meter', description: '打开 Claude 用量面板（限额、消耗曲线、消耗去向）' })
     void $.ui.open({ id: PANE, title: TITLE })
     $.clock.every(MINUTE, () => void tick($).catch(() => undefined))
@@ -327,6 +362,7 @@ export const register: Register = on => {
     const text = e.text.trim().replace(/\s+/g, ' ').slice(0, 80) || '（自动继续）'
     pending.set('main', [])
     usdAtStart = (await $.session.usage()).cost?.usd ?? null
+    void update($, adviceA, () => null).catch(() => undefined)
     await serial(() => update($, currentA, () => newTurn(`${sid}:${e.turnId}`, sid, proj, text, now)))
     return next(e)
   })
@@ -343,7 +379,22 @@ export const register: Register = on => {
     return ran
   }).catch(($, e, next) => next(e))
 
+  on('prompt.edit', async ($, e, next) => {
+    const box = await next(e)
+    // Not awaited: typing never waits on the advice.
+    void adviseDraft($, box.text).catch(() => undefined)
+    return box
+  })
+
+  // Text another plugin or the app puts in the box gets advice too.
+  on('prompt.fill', async ($, e, next) => {
+    const filled = await next(e)
+    if (filled.isFilled) void (async () => adviseDraft($, (await $.prompt.read()).text))().catch(() => undefined)
+    return filled
+  })
+
   on('turn.step', async function* ($, e, next) {
+    if (!e.agentId) currentModel = e.model
     const res = yield* next(e)
     if (res.usage) {
       try {
@@ -387,7 +438,8 @@ export const register: Register = on => {
     if (e.props.hasSurvey) return next(e)
     const els = $.ui.resolve(e)
     const { Box, Text } = els
-    const Svg = 'Svg' in els ? els.Svg : null
+    // The terminal's table lists Svg too, drawn as an empty box: the surface decides.
+    const Svg = e.surface !== 'terminal' && 'Svg' in els ? els.Svg : null
     await read($, nowA) // redraws every minute, for the countdowns
     const now = await $.clock.now()
     const live = await read($, liveA)
@@ -422,25 +474,43 @@ export const register: Register = on => {
     }
     if (seven) items.push(item('band-seven', '本周', currentPct(seven, now), true, fmtReset(seven.resetsAt, now)))
     if (live.ctxPct !== null) items.push(item('band-ctx', '上下文', live.ctxPct, false, ''))
-    if (items.length === 0) return next(e)
+    const advice = await read($, adviceA)
+    if (items.length === 0 && !advice) return next(e)
 
+    const info = advice ? TIER_INFO[advice.tier as Tier] : undefined
     return (
-      <Box flexDirection="row" flexWrap="wrap" columnGap={3} rowGap={0}>
-        {items}
-        {current && (
-          <Text dimColor>
-            本轮 {fmtTok(totalTok(current))} tokens{current.p5 >= 0.05 ? ` · +${fmtPct(current.p5)}` : ''}
-          </Text>
+      <Box flexDirection="column">
+        {items.length > 0 && (
+          <Box flexDirection="row" flexWrap="wrap" columnGap={3} rowGap={0}>
+            {items}
+            {current && (
+              <Text dimColor>
+                本轮 {fmtTok(totalTok(current))} tokens{current.p5 >= 0.05 ? ` · +${fmtPct(current.p5)}` : ''}
+              </Text>
+            )}
+          </Box>
+        )}
+        {advice && info && (
+          <Box key="band-advice" flexDirection="row" flexWrap="wrap" columnGap={1}>
+            <Text dimColor>建议模型</Text>
+            <Text bold color="claude">
+              {info.name}
+            </Text>
+            {advice.fits ? <Text color="success">✓ 当前就是</Text> : <Text dimColor>（{info.use}）</Text>}
+            <Text dimColor>· {advice.reasons.join('、')}</Text>
+            {advice.note !== '' && <Text color={advice.note.includes('不够') ? 'warning' : undefined}>· {advice.note}</Text>}
+            {!advice.fits && <Text dimColor>· 输入 {info.command} 切换</Text>}
+          </Box>
         )}
       </Box>
     )
   })
 
-
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const els = $.ui.resolve(e)
     const { Box, Text, Button } = els
-    const Svg = 'Svg' in els ? els.Svg : null
+    // The terminal's table lists Svg too, drawn as an empty box: the surface decides.
+    const Svg = e.surface !== 'terminal' && 'Svg' in els ? els.Svg : null
     await read($, nowA) // redraws every minute, for the countdowns
     const now = await $.clock.now()
     const view = await read($, viewA)
@@ -683,7 +753,8 @@ export const register: Register = on => {
         </Box>
       )
     } else {
-      const list = [...all].sort((a, b) => b.t0 - a.t0).slice(0, 30)
+      // A turn that never reached the model (interrupted at once) has nothing to show.
+      const list = all.filter(t => t.steps > 0 || t.id === current?.id).sort((a, b) => b.t0 - a.t0).slice(0, 30)
       body = (
         <Box flexDirection="column" gap={1}>
           {list.length === 0 && <Text dimColor>还没有记录。</Text>}

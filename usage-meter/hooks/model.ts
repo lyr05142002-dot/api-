@@ -36,14 +36,16 @@ export function newTurn(id: string, sid: string, proj: string, text: string, t: 
 }
 
 /**
- * Dollars per million uncached input tokens, by model family. Only the ratios
+ * Dollars per million uncached input tokens, by model. Only the ratios
  * matter: they weigh a cheap Haiku request against an Opus one.
  */
 export function priceFactor(model: string): number {
   const m = model.toLowerCase()
-  if (m.includes('haiku')) return 1
-  if (m.includes('sonnet')) return 3
-  return 5
+  if (m.includes('fable') || m.includes('mythos')) return 10
+  if (m.includes('haiku')) return /haiku-[34]/.test(m) ? 1 : 0.1
+  if (m.includes('sonnet')) return /sonnet-[34]/.test(m) ? 3 : 2
+  if (m.includes('opus')) return /opus-5-5/.test(m) ? 4 : 5
+  return 4
 }
 
 export function toolCat(name: string): string {

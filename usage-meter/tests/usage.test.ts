@@ -2,7 +2,8 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, SessionRateLimit } from 'claude-code'
 
-import { attribute, burnBuckets, fmtReset, moved, newTurn, spread, statusLine } from '../hooks/model'
+import { advise, tierOf } from '../hooks/advisor'
+import { attribute, burnBuckets, fmtReset, moved, newTurn, priceFactor, spread, statusLine } from '../hooks/model'
 
 const T0 = Date.parse('2026-10-09T10:00:00Z')
 const usage = (i: number, cw: number, cr: number, o: number) => ({
@@ -12,18 +13,74 @@ const usage = (i: number, cw: number, cr: number, o: number) => ({
   output_tokens: o,
 })
 
+describe('model advice', () => {
+  const ask = (text: string, more: Partial<Parameters<typeof advise>[0]> = {}) =>
+    advise({ text, project: null, current: 'claude-opus-5-5', fivePct: 30, ctxTokens: 10_000, ...more })
+
+  test('a quick question goes to Haiku, with what switching from Opus saves', async () => {
+    const a = ask('解释一下这个函数是什么意思')!
+    expect(a.tier).toBe('haiku')
+    expect(a.reasons).toContain('简单问答')
+    expect(a.fits).toBe(false)
+    expect(a.note).toBe('比当前 Opus 5.5 约省 98% 限额')
+  })
+
+  test('everyday coding goes to Sonnet', async () => {
+    expect(ask('帮我实现一个导出 Excel 的接口，并写单元测试')!.tier).toBe('sonnet')
+    expect(ask('fix the login bug in auth.ts')!.tier).toBe('sonnet')
+  })
+
+  test('a broad refactor or a hard bug goes to Opus, and Opus says it fits', async () => {
+    const a = ask('整个项目的鉴权模块要重构，偶发的死锁问题也要排查根因')!
+    expect(a.tier).toBe('opus')
+    expect(a.fits).toBe(true)
+    expect(a.note).toBe('')
+  })
+
+  test('the hardest, longest asks go to Fable, and the note says the current model may fall short', async () => {
+    const hard = '从零重新设计整个项目的架构，排查并发死锁的根因，给出算法推导和方案对比。' + '详细需求。'.repeat(500)
+    const a = ask(hard)!
+    expect(a.tier).toBe('fable')
+    expect(a.note).toMatch(/当前 Opus 5\.5 可能不够，约多用 2\.5 倍限额/)
+  })
+
+  test('a nearly spent 5-hour limit steps the advice down a tier', async () => {
+    const a = ask('整个项目的鉴权模块要重构，偶发的死锁问题也要排查根因', { fivePct: 85 })!
+    expect(a.tier).toBe('sonnet')
+    expect(a.reasons).toContain('5 小时限额已用 85%')
+  })
+
+  test('a switch in a long conversation warns that the cache is lost', async () => {
+    expect(ask('翻译这句话', { ctxTokens: 180_000 })!.note).toMatch(/对话已有 180k，换模型会让缓存失效/)
+  })
+
+  test('a stack trace counts as debugging, and an empty box gets no advice', async () => {
+    expect(ask('TypeError: x is undefined\n    at foo (a.js:1:2)\n    at bar (b.js:3:4)')!.tier).toBe('sonnet')
+    expect(ask('  ')).toBeNull()
+    expect(tierOf('claude-sonnet-5-5')).toBe('sonnet')
+  })
+
+  test('price weights follow the current lineup', async () => {
+    expect(priceFactor('claude-haiku-5-5')).toBe(0.1)
+    expect(priceFactor('claude-sonnet-5-5')).toBe(2)
+    expect(priceFactor('claude-opus-5-5')).toBe(4)
+    expect(priceFactor('claude-fable-5-1')).toBe(10)
+    expect(priceFactor('claude-haiku-4-5')).toBe(1)
+  })
+})
+
 describe('attribution', () => {
   test('a first request goes to the prompt, re-reading to history, output to the answer', async () => {
     const cats = attribute({ usage: usage(100, 1000, 10000, 200), model: 'claude-sonnet-5-5', index: 0, isSubagent: false, pending: [], calls: [] })
-    expect(cats.prompt).toBe((100 + 1250) * 3)
-    expect(cats.history).toBe(1000 * 3)
-    expect(cats.output).toBe(1000 * 3)
+    expect(cats.prompt).toBe((100 + 1250) * 2)
+    expect(cats.history).toBe(1000 * 2)
+    expect(cats.output).toBe(1000 * 2)
   })
 
   test('new input after tool calls goes to those tools by result size', async () => {
     const cats = attribute({
       usage: usage(0, 3000, 0, 0),
-      model: 'claude-haiku-5-5',
+      model: 'claude-haiku-4-5',
       index: 2,
       isSubagent: false,
       pending: [
@@ -148,8 +205,11 @@ const limits = (five: number, seven: number): SessionRateLimit[] => [
 function session($: Engine, on: On, stored: Record<string, unknown> = {}) {
   mock.store(on, stored)
   const clock = mock.clock(on, { now: T0 })
-  const world = { usd: 0, rateLimits: [] as SessionRateLimit[], status: [] as (string | undefined)[], toasts: [] as string[] }
+  const world = { usd: 0, rateLimits: [] as SessionRateLimit[], status: [] as (string | undefined)[], toasts: [] as string[], box: '' }
   on('session.id', () => ({ value: 'abcdef1234567890' }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('prompt.fill', () => ({ isFilled: true }))
+  on('prompt.read', () => ({ value: { text: world.box, cursor: world.box.length } }))
   on('session.usage', () => ({
     value: { startedAt: T0, context: { window: 200_000, tokens: 24_000, percent: 12 }, rateLimits: world.rateLimits, cost: { usd: world.usd } },
   }))
@@ -179,6 +239,7 @@ function session($: Engine, on: On, stored: Record<string, unknown> = {}) {
     clock,
     world,
     start: () => $.session.start({ cwd: '/home/me/my-app', surface: 'desktop', isInteractive: true }),
+    type: (text: string) => ((world.box = text), $.prompt.fill({ text, mode: 'replace', origin: { kind: 'engine' } })),
     measure: async (five: number, seven: number) => {
       world.rateLimits = limits(five, seven)
       await $.session.measure({ context: { window: 200_000, tokens: 26_000, percent: 13 }, rateLimits: world.rateLimits, cost: { usd: world.usd }, changed: ['rateLimits'] })
@@ -210,6 +271,8 @@ describe('in a session', () => {
       const ui = await $.ui.mount({ plugin: 'usage-meter', surface, ...PANE })
       expect(await ui.find({ type: 'Text', text: '5 小时会话限额' })).toBeDefined()
       expect(await ui.find({ type: 'Text', text: /61%/ })).toBeDefined()
+      if (surface === 'terminal') expect(await ui.find({ type: 'Text', text: /█/ })).toBeDefined()
+      else expect((await ui.findAll({ type: 'Svg' })).length).toBeGreaterThan(0)
       await ui.press({ key: 'tab-where' })
       expect(await ui.find({ type: 'Text', text: '工具 Bash' })).toBeDefined()
       await ui.press({ key: 'tab-time' })
@@ -239,6 +302,9 @@ describe('in a session', () => {
       expect(await ui.find({ type: 'Text', text: '5 小时' })).toBeDefined()
       expect(await ui.find({ type: 'Text', text: '61%' })).toBeDefined()
       expect(await ui.find({ type: 'Text', text: '4 小时 0 分后重置' })).toBeDefined()
+      // The bars themselves: text blocks on the terminal, vector bars elsewhere.
+      if (surface === 'terminal') expect(await ui.find({ type: 'Text', text: '██████░░░░' })).toBeDefined()
+      else expect(await ui.findAll({ type: 'Svg' })).toHaveLength(3)
       expect(await ui.find({ type: 'Text', text: '本周' })).toBeDefined()
       expect(await ui.find({ type: 'Text', text: '上下文' })).toBeDefined()
       await ui.unmount()
@@ -253,6 +319,37 @@ describe('in a session', () => {
     expect(await survey.find({ type: 'Text', text: '5 小时' })).toBeUndefined()
     expect(await survey.find({ type: 'Text', text: 'survey' })).toBeDefined()
     await survey.unmount()
+  })
+
+  test('the strip advises a model for what is being typed, and clears it once sent', async ($, on) => {
+    const s = session($, on)
+    const BAND = {
+      component: 'AbovePrompt' as const,
+      requestId: 'band',
+      props: { hasSurvey: false, isWorking: false, maxRows: 6, bodyColumns: 100, scroll: { offset: 0, bodyRows: 6 }, view: {} },
+    }
+    await s.start()
+    await s.measure(40, 10)
+    await s.type('解释一下 useEffect 是什么意思')
+    await s.clock.settle()
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const ui = await $.ui.mount({ plugin: 'usage-meter', surface, ...BAND })
+      expect(await ui.find({ type: 'Text', text: 'Haiku 5.5' })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /比当前 Opus 5\.5 约省 98% 限额/ })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: /\/model haiku/ })).toBeDefined()
+      await ui.unmount()
+    }
+    await s.type('整个项目的鉴权模块要重构，偶发的死锁问题也要排查根因')
+    await s.clock.settle()
+    let ui = await $.ui.mount({ plugin: 'usage-meter', surface: 'desktop', ...BAND })
+    expect(await ui.find({ type: 'Text', text: 'Opus 5.5' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '✓ 当前就是' })).toBeDefined()
+    await ui.unmount()
+    await $.turn.start({ text: 'sent', turnId: 't1' })
+    await s.clock.settle()
+    ui = await $.ui.mount({ plugin: 'usage-meter', surface: 'desktop', ...BAND })
+    expect(await ui.find({ type: 'Text', text: '建议模型' })).toBeUndefined()
+    await ui.unmount()
   })
 
   test('points another session already claimed are not claimed again', async ($, on) => {
