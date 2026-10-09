@@ -47,17 +47,120 @@
 
 面板关掉以后，输入 `/usage-meter` 就能重新打开。
 
-## 安装
+## 安装（Windows，一步一步来）
 
-需要 Claude Code 2.1.275 或更新版本。在终端里运行 `claude`，然后在提示符里输入：
+只装了 Claude 桌面 App 的电脑上没有 `claude` 命令，要先装 Claude Code 命令行，再用它装插件。下面每一步都配了截图（用户名已打码），图下方就是要复制的命令。
 
+**粘贴前先读一下这三点：**
+- 一次只粘贴一行。粘贴前先按 `Esc` 清空输入行，粘贴后按回车，等它跑完、重新出现 `PS C:\Users\…>` 再粘下一行。不这样做，命令会和输入行里已有的字连在一起，报"不允许使用与号"或"包含意外的标记"。
+- 第 2 到第 5 步都在**同一个** PowerShell 窗口里做，中途不要关。代理设置只在当前窗口有效。
+- 截图里的 `7897` 是代理端口，要换成你第 1 步看到的那个。
+
+### 第 1 步：查看代理地址
+
+![第 1 步：查看代理地址](docs/images/step1-proxy.png)
+
+```powershell
+(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings').ProxyServer
 ```
-/plugin install usage-meter --marketplace lyr05142002-dot/api-
+
+### 第 2 步：带上代理，安装 Claude Code
+
+![第 2 步：安装 Claude Code](docs/images/step2-install.png)
+
+```powershell
+$env:HTTPS_PROXY="http://127.0.0.1:7897"; $env:HTTP_PROXY="http://127.0.0.1:7897"; irm https://claude.ai/install.ps1 | iex
 ```
 
-提示 `Add marketplace?` 时按 `y`，范围选 user（第一个，直接回车）。装好以后当前会话马上生效，之后开的每个会话都会自动加载，包括桌面 App 的 Code 页。
+### 第 3 步：确认安装，并把 claude 加进命令路径
 
-> 桌面 App 的 Code 页里不能直接执行 `/plugin install`，要先在终端装一次。装在 user 范围以后，App 里的会话也会加载它。
+![第 3 步：确认安装并加入命令路径](docs/images/step3-path.png)
+
+```powershell
+& "$env:USERPROFILE\.local\bin\claude.exe" --version
+```
+
+```powershell
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ";$env:USERPROFILE\.local\bin", 'User')
+```
+
+### 第 4 步：检查 Git
+
+![第 4 步：检查 Git](docs/images/step4-git.png)
+
+```powershell
+git --version
+```
+
+报"无法识别"就是没装 Git。可以运行 `winget install Git.Git` 先装上，或者跳过 Git，用下面的「不用 Git 的装法」。
+
+### 第 5 步：安装用量面板插件
+
+![第 5 步：安装插件](docs/images/step5-plugin.png)
+
+```powershell
+& "$env:USERPROFILE\.local\bin\claude.exe" plugin marketplace add lyr05142002-dot/api-
+```
+
+```powershell
+& "$env:USERPROFILE\.local\bin\claude.exe" plugin install usage-meter@lyr-api
+```
+
+### 第 6 步：重启 Claude App，看效果
+
+![第 6 步：效果](docs/images/step6-result.png)
+
+一定要**完全退出** Claude 桌面 App：右键任务栏右下角托盘里的 Claude 图标，选退出。然后重新打开，进入 Code 页，先随便发一句话，输入框上方就会出现用量条。
+
+### 不用 Git 的装法
+
+1. 在浏览器打开 https://github.com/lyr05142002-dot/api-，点绿色的 **Code → Download ZIP**。
+2. 把压缩包解压到「下载」文件夹，得到 `api--main` 文件夹。打开看一下：里面应该直接有 `usage-meter` 文件夹和 `README.md`。如果里面又套了一层 `api--main`，下面命令里的路径就写成 `Downloads\api--main\api--main`。
+3. 用下面两行代替第 5 步：
+
+```powershell
+& "$env:USERPROFILE\.local\bin\claude.exe" plugin marketplace add "$env:USERPROFILE\Downloads\api--main"
+```
+
+```powershell
+& "$env:USERPROFILE\.local\bin\claude.exe" plugin install usage-meter@lyr-api
+```
+
+这种装法以后要更新时，重新下载解压一次 ZIP，再执行下面「以后更新」里的命令。
+
+### 以后更新
+
+新开一个 PowerShell，一次一行：
+
+```powershell
+$env:HTTPS_PROXY="http://127.0.0.1:7897"; $env:HTTP_PROXY="http://127.0.0.1:7897"
+```
+
+```powershell
+claude plugin update usage-meter@lyr-api
+```
+
+然后完全退出 Claude App 再打开。
+
+### 常见报错
+
+| 看到的报错 | 原因 | 怎么办 |
+| --- | --- | --- |
+| `无法将"claude"项识别为 cmdlet…` | Claude Code 命令行没装，或者还没加进命令路径 | 做第 2、3 步；第 3 步之后要新开窗口才能直接用 `claude` |
+| `connect ECONNREFUSED …:443` | 安装程序没走代理，连不上下载服务器 | 用第 2 步那一整行，它会先设好代理再安装 |
+| `不允许使用与号(&)` 或 `表达式或语句中包含意外的标记` | 粘贴的命令和输入行里已有的字连在了一起 | 先按 `Esc` 清空输入行，一次只粘贴一行 |
+| 第 1 步什么都没显示 | 代理软件没开「系统代理」 | 在代理软件里打开「系统代理」，再做一次第 1 步 |
+| `git` 无法识别 | 没装 Git | `winget install Git.Git`，或用「不用 Git 的装法」 |
+
+### macOS / Linux
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash
+claude plugin marketplace add lyr05142002-dot/api-
+claude plugin install usage-meter@lyr-api
+```
+
+需要代理时，先运行 `export HTTPS_PROXY=http://127.0.0.1:端口`。已经装了 Claude Code 的话，也可以在 `claude` 里直接输入 `/plugin install usage-meter --marketplace lyr05142002-dot/api-`。
 
 ## 数据从哪来，准不准
 
