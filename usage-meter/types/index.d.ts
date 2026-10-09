@@ -43,6 +43,8 @@ export type UsageMeterTurn = {
   steps: number
   tools: number
   agents: number
+  /** The tier advised for the prompt, when one was. */
+  adv?: string
 }
 
 /** The latest figures, as the status line has them. */
@@ -61,7 +63,14 @@ export type UsageMeterLive = {
 export type UsageMeterCtxCat = { name: string; tokens: number; kind: string }
 
 /** The model advised for the prompt being typed. */
-export type UsageMeterAdvice = { tier: string; reasons: string[]; note: string; fits: boolean }
+export type UsageMeterAdvice = {
+  tier: string
+  reasons: string[]
+  note: string
+  fits: boolean
+  /** True for a prompt already sent (the desktop app shows no draft to plugins). */
+  sent?: boolean
+}
 
 export type UsageMeterTab = 'now' | 'time' | 'where' | 'turns'
 export type UsageMeterRange = '5h' | '24h' | '7d'

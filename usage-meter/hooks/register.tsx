@@ -10,7 +10,7 @@ import type {
   UsageMeterTab as Tab,
   UsageMeterTurn as Turn,
 } from '../types'
-import { TIER_INFO, type Project, type Tier, advise } from './advisor'
+import { TIER_INFO, type Advice, type Project, type Tier, advise, mixText, projectMix } from './advisor'
 import { burnChartSvg, levels, limitsChartSvg, meterSvg, meterText, sparkText } from './charts'
 import {
   KEEP_MS,
@@ -299,8 +299,12 @@ async function sizeProject($: EngineInterface): Promise<void> {
   project = { files: top.length, codeFiles: top.filter(f => f.kind === 'file' && CODE.test(f.name)).length }
 }
 
-/** Advises a model for the draft in the box; writes only when the advice changed. */
-async function adviseDraft($: EngineInterface, text: string): Promise<void> {
+/**
+ * Advises a model for a prompt: the draft in the terminal's box, or one just
+ * sent (the desktop app draws its own box, which plugins never see).
+ * Writes only when the advice changed.
+ */
+async function adviseDraft($: EngineInterface, text: string, sent = false): Promise<Advice | null> {
   const live = await read($, liveA)
   const five = live.limits.find(l => l.kind === 'five_hour')
   const next = advise({
@@ -310,8 +314,10 @@ async function adviseDraft($: EngineInterface, text: string): Promise<void> {
     fivePct: five ? currentPct(five, await $.clock.now()) : null,
     ctxTokens: live.ctxTokens,
   })
+  const shown = next && { ...next, sent }
   const was = await read($, adviceA)
-  if (JSON.stringify(was) !== JSON.stringify(next)) await update($, adviceA, () => next)
+  if (JSON.stringify(was) !== JSON.stringify(shown)) await update($, adviceA, () => shown)
+  return next
 }
 
 async function start($: EngineInterface, cwd: string): Promise<void> {
@@ -362,8 +368,11 @@ export const register: Register = on => {
     const text = e.text.trim().replace(/\s+/g, ' ').slice(0, 80) || '（自动继续）'
     pending.set('main', [])
     usdAtStart = (await $.session.usage()).cost?.usd ?? null
-    void update($, adviceA, () => null).catch(() => undefined)
-    await serial(() => update($, currentA, () => newTurn(`${sid}:${e.turnId}`, sid, proj, text, now)))
+    // The model it will run on: the person may have switched since the last turn.
+    currentModel = await $.session.model().catch(() => currentModel)
+    const adv = await adviseDraft($, e.text, true).catch(() => null)
+    const turn = newTurn(`${sid}:${e.turnId}`, sid, proj, text, now)
+    await serial(() => update($, currentA, () => (adv ? { ...turn, adv: adv.tier } : turn)))
     return next(e)
   })
 
@@ -478,6 +487,7 @@ export const register: Register = on => {
     if (items.length === 0 && !advice) return next(e)
 
     const info = advice ? TIER_INFO[advice.tier as Tier] : undefined
+    const mix = projectMix(current ? [...(await read($, turnsA)), current] : await read($, turnsA), proj)
     return (
       <Box flexDirection="column">
         {items.length > 0 && (
@@ -492,7 +502,7 @@ export const register: Register = on => {
         )}
         {advice && info && (
           <Box key="band-advice" flexDirection="row" flexWrap="wrap" columnGap={1}>
-            <Text dimColor>建议模型</Text>
+            <Text dimColor>{advice.sent ? '这条消息建议' : '建议模型'}</Text>
             <Text bold color="claude">
               {info.name}
             </Text>
@@ -500,6 +510,7 @@ export const register: Register = on => {
             <Text dimColor>· {advice.reasons.join('、')}</Text>
             {advice.note !== '' && <Text color={advice.note.includes('不够') ? 'warning' : undefined}>· {advice.note}</Text>}
             {!advice.fits && <Text dimColor>· 输入 {info.command} 切换</Text>}
+            {mix && <Text dimColor>· {mixText(mix)}</Text>}
           </Box>
         )}
       </Box>
@@ -605,6 +616,7 @@ export const register: Register = on => {
       const mine = all.filter(t => t.sid === sid)
       const sessionTok = mine.reduce((s, t) => s + totalTok(t), 0)
       const inWindow = shares(all, windowStart(live.limits, 'five_hour', now), t => t.cats)
+      const mixNow = projectMix(all, proj)
       const top = inWindow.slice(0, 3)
       const topW = inWindow.reduce((s, x) => s + x.w, 0)
       body = (
@@ -638,6 +650,12 @@ export const register: Register = on => {
               <Text bold>本窗口消耗最多</Text>
               {top.map(x => row(catLabel(x.key), fmtPct(topW > 0 ? (x.w / topW) * 100 : 0)))}
             </Box>
+          )}
+          {mixNow && (
+            <Text>
+              本项目建议默认用 <Text bold color="claude">{TIER_INFO[mixNow.top].name}</Text>
+              <Text dimColor>（{mixText(mixNow)}，按你发过的消息分析）</Text>
+            </Text>
           )}
           <Text dimColor>
             本会话 {mine.length} 轮 · {fmtTok(sessionTok)} tokens{live.usd !== null ? ` · 按 API 价约 ${fmtUsd(live.usd)}` : ''}
@@ -768,6 +786,7 @@ export const register: Register = on => {
                   {t.proj} · {fmtTok(totalTok(t))} tokens · {t.steps} 次请求{t.tools ? ` · ${t.tools} 次工具` : ''}
                   {t.agents ? ` · ${t.agents} 个子代理` : ''}
                   {t.usd !== null ? ` · ${fmtUsd(t.usd)}` : ''}
+                  {t.adv && TIER_INFO[t.adv as Tier] ? ` · 建议 ${TIER_INFO[t.adv as Tier].name}` : ''}
                   {top ? ` · 多在${catLabel(top.key)}` : ''}
                 </Text>
               </Box>

@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On, SessionRateLimit } from 'claude-code'
 
-import { advise, tierOf } from '../hooks/advisor'
+import { advise, mixText, projectMix, tierOf } from '../hooks/advisor'
 import { attribute, burnBuckets, fmtReset, moved, newTurn, priceFactor, spread, statusLine } from '../hooks/model'
 
 const T0 = Date.parse('2026-10-09T10:00:00Z')
@@ -58,6 +58,16 @@ describe('model advice', () => {
     expect(ask('TypeError: x is undefined\n    at foo (a.js:1:2)\n    at bar (b.js:3:4)')!.tier).toBe('sonnet')
     expect(ask('  ')).toBeNull()
     expect(tierOf('claude-sonnet-5-5')).toBe('sonnet')
+  })
+
+  test('the last prompts of a project tally into the model to default to there', async () => {
+    const t = (adv: string, t0: number, proj = 'app') => ({ proj, adv, t0 })
+    expect(projectMix([t('haiku', 1), t('opus', 2)], 'app')).toBeNull()
+    const mix = projectMix([t('haiku', 1), t('sonnet', 2), t('sonnet', 3), t('opus', 4), t('opus', 5, 'other')], 'app')!
+    expect(mix.top).toBe('sonnet')
+    expect(mixText(mix)).toBe('本项目近 4 条：Sonnet 2、Opus 1、Haiku 1')
+    // A tie goes to the stronger model, so the default is never too weak.
+    expect(projectMix([t('haiku', 1), t('opus', 2), t('haiku', 3), t('opus', 4)], 'app')!.top).toBe('opus')
   })
 
   test('price weights follow the current lineup', async () => {
@@ -321,7 +331,7 @@ describe('in a session', () => {
     await survey.unmount()
   })
 
-  test('the strip advises a model for what is being typed, and clears it once sent', async ($, on) => {
+  test('the strip advises a model for what is being typed, then for the message once sent', async ($, on) => {
     const s = session($, on)
     const BAND = {
       component: 'AbovePrompt' as const,
@@ -348,8 +358,36 @@ describe('in a session', () => {
     await $.turn.start({ text: 'sent', turnId: 't1' })
     await s.clock.settle()
     ui = await $.ui.mount({ plugin: 'usage-meter', surface: 'desktop', ...BAND })
+    expect(await ui.find({ type: 'Text', text: '这条消息建议' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: '建议模型' })).toBeUndefined()
     await ui.unmount()
+  })
+
+  test('in the desktop app, where typing is unseen, each sent message is advised and the project tallied', async ($, on) => {
+    const s = session($, on)
+    const BAND = {
+      component: 'AbovePrompt' as const,
+      requestId: 'band',
+      props: { hasSurvey: false, isWorking: false, maxRows: 6, bodyColumns: 100, scroll: { offset: 0, bodyRows: 6 }, view: {} },
+    }
+    await s.start()
+    await s.measure(40, 10)
+    await s.turn('解释一下这个函数是什么意思', 't1', 0.01)
+    await s.turn('把这句话翻译成英文', 't2', 0.02)
+    await s.turn('整个项目的鉴权模块要重构，偶发的死锁问题也要排查根因', 't3', 0.5)
+    await s.clock.settle()
+    const band = await $.ui.mount({ plugin: 'usage-meter', surface: 'desktop', ...BAND })
+    expect(await band.find({ type: 'Text', text: '这条消息建议' })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: 'Opus 5.5' })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: '· 本项目近 3 条：Haiku 2、Opus 1' })).toBeDefined()
+    await band.unmount()
+    const pane = await $.ui.mount({ plugin: 'usage-meter', surface: 'desktop', ...PANE })
+    expect(await pane.find({ type: 'Text', text: /本项目建议默认用/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: 'Haiku 5.5' })).toBeDefined()
+    await pane.press({ key: 'tab-turns' })
+    expect(await pane.find({ type: 'Text', text: /建议 Haiku 5\.5/ })).toBeDefined()
+    expect(await pane.find({ type: 'Text', text: /建议 Opus 5\.5/ })).toBeDefined()
+    await pane.unmount()
   })
 
   test('points another session already claimed are not claimed again', async ($, on) => {

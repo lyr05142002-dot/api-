@@ -134,3 +134,22 @@ export function advise(a: {
   }
   return { tier, reasons: reasons.slice(0, 3), note, fits }
 }
+
+export type Mix = { n: number; counts: [Tier, number][]; top: Tier }
+
+/**
+ * What the last prompts asked in one project needed, most advised first:
+ * the model to default to there. Null under three advised prompts.
+ */
+export function projectMix(turns: readonly { proj: string; adv?: string; t0: number }[], proj: string, last = 20): Mix | null {
+  const advised = turns.filter(t => t.proj === proj && t.adv && tierOf(t.adv) !== null).sort((a, b) => b.t0 - a.t0).slice(0, last)
+  if (advised.length < 3) return null
+  const counts = new Map<Tier, number>()
+  for (const t of advised) counts.set(t.adv as Tier, (counts.get(t.adv as Tier) ?? 0) + 1)
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || TIERS.indexOf(b[0]) - TIERS.indexOf(a[0]))
+  return { n: advised.length, counts: sorted, top: sorted[0]![0] }
+}
+
+export function mixText(mix: Mix): string {
+  return `本项目近 ${mix.n} 条：${mix.counts.map(([tier, n]) => `${TIER_INFO[tier].name.split(' ')[0]} ${n}`).join('、')}`
+}
