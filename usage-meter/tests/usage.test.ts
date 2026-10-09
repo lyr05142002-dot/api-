@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
-import type { SessionRateLimit } from 'claude-code'
+import type { Engine } from 'claude-code/testing'
+import type { On, SessionRateLimit } from 'claude-code'
 
 import { attribute, burnBuckets, fmtReset, moved, newTurn, spread, statusLine } from '../hooks/model'
 
@@ -67,6 +68,33 @@ describe('attribution', () => {
     expect(b).toEqual([0, 5, 2, 2])
   })
 
+  test('a dipping reading adds nothing, and the rise back to the high mark is not counted twice', async () => {
+    const b = burnBuckets(
+      [
+        [0, 61, 1, null, 500],
+        [10, 60, 1, null, 500],
+        [20, 62, 1, null, 500],
+      ],
+      0,
+      30,
+      3,
+    )
+    expect(b).toEqual([0, 0, 1])
+  })
+
+  test('a later reset time is a new window, whatever the figures', async () => {
+    const b = burnBuckets(
+      [
+        [0, 40, 1, null, 500],
+        [10, 30, 1, null, 900],
+      ],
+      0,
+      20,
+      2,
+    )
+    expect(b).toEqual([0, 30])
+  })
+
   test('reset text and status line read like the app', async () => {
     const now = T0
     expect(fmtReset(new Date(now + 3 * 3600_000 + 44 * 60_000).toISOString(), now)).toBe('3 小时 44 分后重置')
@@ -83,71 +111,79 @@ describe('attribution', () => {
   })
 })
 
+const RESETS = new Date(T0 + 4 * 3600_000).toISOString()
+const PANE = {
+  component: 'Pane' as const,
+  requestId: 'usage-meter',
+  props: { title: 'Claude 用量', isFocused: false, bodyColumns: 60, placement: 'dock' as const, scroll: { offset: 0, bodyRows: 40 }, view: {} },
+}
+const limits = (five: number, seven: number): SessionRateLimit[] => [
+  { kind: 'five_hour', percentUsed: five, resetsAt: RESETS },
+  { kind: 'seven_day', percentUsed: seven },
+]
+
+/** A session with the engine's ends mocked: one tool call per turn, then an answer. */
+function session($: Engine, on: On, stored: Record<string, unknown> = {}) {
+  mock.store(on, stored)
+  const clock = mock.clock(on, { now: T0 })
+  const world = { usd: 0, rateLimits: [] as SessionRateLimit[], status: [] as (string | undefined)[] }
+  on('session.id', () => ({ value: 'abcdef1234567890' }))
+  on('session.usage', () => ({
+    value: { startedAt: T0, context: { window: 200_000, tokens: 24_000, percent: 12 }, rateLimits: world.rateLimits, cost: { usd: world.usd } },
+  }))
+  on('ui.status', (_$, e) => (world.status.push(e.text), { value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('command.register', (_$, e) => ({ value: { command: e.name } }))
+  // The engine's own ends of the events the plugin observes.
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  on('session.measure', (_$, e) => ({ changed: e.changed }))
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_$, e) => ({ text: e.answer }))
+  on('tool.call', () => ({ result: 'x'.repeat(400), text: 'x'.repeat(400) }))
+  let step = 0
+  on('turn.step', async function* (_$, e) {
+    step++
+    return {
+      turnId: e.turnId,
+      index: e.index,
+      answer: '',
+      toolUses: e.index === 0 ? [{ name: 'Bash', input: {} }] : [],
+      stopReason: 'end_turn' as const,
+      usage: { ...usage(10, 2000, step === 1 ? 0 : 20_000, 300), model: 'claude-opus-5-5' },
+    }
+  })
+  return {
+    clock,
+    world,
+    start: () => $.session.start({ cwd: '/home/me/my-app', surface: 'desktop', isInteractive: true }),
+    measure: async (five: number, seven: number) => {
+      world.rateLimits = limits(five, seven)
+      await $.session.measure({ context: { window: 200_000, tokens: 26_000, percent: 13 }, rateLimits: world.rateLimits, cost: { usd: world.usd }, changed: ['rateLimits'] })
+    },
+    turn: async (text: string, id: string, usd: number) => {
+      await $.turn.start({ text, turnId: id })
+      for await (const _ of $.turn.step({ turnId: id, index: 0, model: 'claude-opus-5-5', messageCount: 1 })) void _
+      await $.tool.call({ tool: 'Bash', tool_use_id: `${id}-u1`, command: 'ls' } as never)
+      for await (const _ of $.turn.step({ turnId: id, index: 1, model: 'claude-opus-5-5', messageCount: 3 })) void _
+      await clock.advance(60_000)
+      world.usd = usd
+      await $.turn.complete({ turnId: id, reason: 'answer', isAborted: false, answer: 'done', durationMs: 60_000 })
+    },
+  }
+}
+
 describe('in a session', () => {
   test('a turn is counted, the limits it moved are shared to it, and the pane draws it', async ($, on) => {
-    mock.store(on)
-    const clock = mock.clock(on, { now: T0 })
-    let usd = 0
-    let rateLimits: SessionRateLimit[] = []
-    const resetsAt = new Date(T0 + 4 * 3600_000).toISOString()
-    const status: (string | undefined)[] = []
-    on('session.id', () => ({ value: 'abcdef1234567890' }))
-    on('session.usage', () => ({
-      value: {
-        startedAt: T0,
-        context: { window: 200_000, tokens: 24_000, percent: 12 },
-        rateLimits,
-        cost: { usd },
-      },
-    }))
-    on('ui.status', (_$, e) => (status.push(e.text), { value: undefined }))
-    on('ui.toast', () => ({ value: undefined }))
-    on('ui.open', () => ({ value: { isPlaced: true as const } }))
-    on('command.register', (_$, e) => ({ value: { command: e.name } }))
-    // The engine's own ends of the events the plugin observes.
-    on('session.start', (_$, e) => ({ cwd: e.cwd }))
-    on('session.measure', (_$, e) => ({ changed: e.changed }))
-    on('turn.start', (_$, e) => ({ turnId: e.turnId }))
-    on('turn.complete', (_$, e) => ({ text: e.answer }))
-    on('tool.call', () => ({ result: 'x'.repeat(400), text: 'x'.repeat(400) }))
-    let step = 0
-    on('turn.step', async function* (_$, e) {
-      step++
-      return {
-        turnId: e.turnId,
-        index: e.index,
-        answer: '',
-        toolUses: e.index === 0 ? [{ name: 'Bash', input: {} }] : [],
-        stopReason: 'end_turn' as const,
-        usage: { ...usage(10, 2000, step === 1 ? 0 : 20_000, 300), model: 'claude-opus-5-5' },
-      }
-    })
+    const s = session($, on)
+    await s.start()
+    await s.measure(58, 9.5) // a first reading is the baseline
+    await s.turn('帮我  修一下 登录页', 't1', 0.42)
+    await s.measure(61, 10)
+    await s.clock.settle()
 
-    await $.session.start({ cwd: '/home/me/my-app', surface: 'desktop', isInteractive: true })
+    expect(s.world.status[s.world.status.length - 1]).toMatch(/^用量 5h 61% \(3h59m\) · 本周 10% · 上下文 13%$/)
 
-    // A first reading is the baseline.
-    rateLimits = [{ kind: 'five_hour', percentUsed: 58, resetsAt }, { kind: 'seven_day', percentUsed: 9.5 }]
-    await $.session.measure({ context: { window: 200_000, tokens: 24_000, percent: 12 }, rateLimits, changed: ['rateLimits'] })
-
-    await $.turn.start({ text: '帮我  修一下 登录页', turnId: 't1' })
-    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 1 })) void _
-    await $.tool.call({ tool: 'Bash', tool_use_id: 'u1', command: 'ls' } as never)
-    for await (const _ of $.turn.step({ turnId: 't1', index: 1, model: 'claude-opus-5-5', messageCount: 3 })) void _
-    await clock.advance(60_000)
-    usd = 0.42
-    await $.turn.complete({ turnId: 't1', reason: 'answer', isAborted: false, answer: 'done', durationMs: 60_000 })
-
-    rateLimits = [{ kind: 'five_hour', percentUsed: 61, resetsAt }, { kind: 'seven_day', percentUsed: 10 }]
-    await $.session.measure({ context: { window: 200_000, tokens: 26_000, percent: 13 }, rateLimits, cost: { usd }, changed: ['rateLimits'] })
-    await clock.settle()
-
-    expect(status[status.length - 1]).toMatch(/^用量 5h 61% \(3h59m\) · 本周 10% · 上下文 13%$/)
-
-    const PANE = {
-      component: 'Pane' as const,
-      requestId: 'usage-meter',
-      props: { title: 'Claude 用量', isFocused: false, bodyColumns: 60, placement: 'dock' as const, scroll: { offset: 0, bodyRows: 40 }, view: {} },
-    }
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await $.ui.mount({ plugin: 'usage-meter', surface, ...PANE })
       expect(await ui.find({ type: 'Text', text: '5 小时会话限额' })).toBeDefined()
@@ -164,5 +200,42 @@ describe('in a session', () => {
       await ui.press({ key: 'tab-now' })
       await ui.unmount()
     }
+  })
+
+  test('points another session already claimed are not claimed again', async ($, on) => {
+    // Another session read 61% a moment ago; this one last saw nothing.
+    const s = session($, on, { last: { t: T0, five: { kind: 'five_hour', pct: 61, resetsAt: RESETS } } })
+    await s.start()
+    await s.turn('第二个会话', 't1', 0.1)
+    await s.measure(62, 10)
+    const ui = await $.ui.mount({ plugin: 'usage-meter', surface: 'desktop', ...PANE })
+    await ui.press({ key: 'tab-turns' })
+    expect(await ui.find({ type: 'Text', text: '+1%' })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a few minutes of pause before a prompt still counts toward that turn', async ($, on) => {
+    const s = session($, on, { last: { t: T0 - 5 * 60_000, five: { kind: 'five_hour', pct: 58, resetsAt: RESETS } } })
+    await s.start()
+    await s.turn('想了一会儿再问', 't1', 0.1)
+    await s.measure(61, 10)
+    const ui = await $.ui.mount({ plugin: 'usage-meter', surface: 'desktop', ...PANE })
+    await ui.press({ key: 'tab-turns' })
+    expect(await ui.find({ type: 'Text', text: '+3%' })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('what moved during an idle gap goes to 「其他」, not to the next turn', async ($, on) => {
+    // The newest reading is 45 minutes older than the turn: the web app may have spent since.
+    const s = session($, on, { last: { t: T0 - 45 * 60_000, five: { kind: 'five_hour', pct: 50, resetsAt: RESETS } } })
+    await s.start()
+    await s.turn('空闲之后', 't1', 0.1)
+    await s.measure(61, 10)
+    const ui = await $.ui.mount({ plugin: 'usage-meter', surface: 'desktop', ...PANE })
+    await ui.press({ key: 'tab-turns' })
+    expect(await ui.find({ type: 'Text', text: /^\+/ })).toBeUndefined()
+    await ui.press({ key: 'tab-where' })
+    expect(await ui.find({ type: 'Text', text: /^其他/ })).toBeDefined()
+    await ui.unmount()
   })
 })

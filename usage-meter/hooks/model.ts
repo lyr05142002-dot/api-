@@ -9,7 +9,7 @@ import type {
 export const MINUTE = 60_000
 export const HOUR = 60 * MINUTE
 export const DAY = 24 * HOUR
-const KEEP_MS = 8 * DAY
+export const KEEP_MS = 8 * DAY
 const MAX_TURNS = 1500
 const MAX_SAMPLES = 4000
 
@@ -198,20 +198,51 @@ export function shares(turns: readonly Turn[], since: number, pick: (t: Turn) =>
     .sort((x, y) => y.w - x.w)
 }
 
-/** Positive moves of the 5-hour window per time bucket, from the readings. */
+/** Whether `b` was read in a later 5-hour window than `a`. */
+function isRollover(a: Sample, b: Sample): boolean {
+  if (a[4] != null && b[4] != null) return b[4] > a[4]
+  // Readings from 0.1.0 carry no reset time: only a fall by half reads as one.
+  return b[1]! < a[1]! / 2
+}
+
+/**
+ * Points of the 5-hour window spent per time bucket, from the readings.
+ *
+ * Counted against the highest reading of the window so far, so a reading that
+ * dips (another session's, taken a moment earlier) adds nothing, and the
+ * rise back to the high mark is not counted twice.
+ */
 export function burnBuckets(samples: readonly Sample[], from: number, to: number, n: number): number[] {
   const out = new Array<number>(n).fill(0)
   const size = (to - from) / n
-  for (let i = 1; i < samples.length; i++) {
-    const a = samples[i - 1]!
-    const b = samples[i]!
-    if (b[0] < from || b[0] > to || a[1] === null || b[1] === null) continue
-    // A drop means the window rolled over: what it shows now was spent since.
-    const d = b[1] >= a[1] ? b[1] - a[1] : b[1]
-    const k = Math.min(n - 1, Math.floor((b[0] - from) / size))
-    out[k] = out[k]! + d
+  let high: Sample | undefined
+  for (const s of samples) {
+    if (s[1] === null) continue
+    let d = 0
+    if (!high || isRollover(high, s)) {
+      d = high ? s[1] : 0
+      high = s
+    } else if (s[1] > high[1]!) {
+      d = s[1] - high[1]!
+      high = s
+    }
+    if (d > 0 && s[0] >= from && s[0] <= to) {
+      const k = Math.min(n - 1, Math.floor((s[0] - from) / size))
+      out[k] = out[k]! + d
+    }
   }
   return out
+}
+
+export function limitsOf(rateLimits: readonly { kind: string; percentUsed: number; resetsAt?: string }[]): Limit[] {
+  return rateLimits.map(r => ({ kind: r.kind, pct: r.percentUsed, resetsAt: r.resetsAt }))
+}
+
+/** The higher of two readings of one window; a later window wins. */
+export function higher(prev: Limit | undefined, cur: Limit | undefined): Limit | undefined {
+  if (!prev || !cur) return cur ?? prev
+  if (prev.resetsAt !== cur.resetsAt) return (Date.parse(cur.resetsAt ?? '') || 0) >= (Date.parse(prev.resetsAt ?? '') || 0) ? cur : prev
+  return cur.pct >= prev.pct ? cur : prev
 }
 
 const LABELS: Record<string, string> = {

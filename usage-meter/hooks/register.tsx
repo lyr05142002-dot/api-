@@ -3,7 +3,7 @@ import type { EngineInterface, Register, SessionMeasureInput, TurnUsage } from '
 
 import type {
   UsageMeterCtxCat as CtxCat,
-  UsageMeterLimit as Limit,
+  UsageMeterLast as Last,
   UsageMeterLive as Live,
   UsageMeterRange as Range,
   UsageMeterSample as Sample,
@@ -12,6 +12,7 @@ import type {
 } from '../types'
 import { burnChartSvg, levels, limitsChartSvg, meterSvg, meterText, sparkText } from './charts'
 import {
+  KEEP_MS,
   MINUTE,
   RANGE_MS,
   type Pending,
@@ -26,8 +27,10 @@ import {
   fmtReset,
   fmtTok,
   fmtUsd,
+  higher,
   isNewSample,
   limitLabel,
+  limitsOf,
   mergeSamples,
   mergeTurns,
   modelLabel,
@@ -52,6 +55,7 @@ const liveA = atom({ plugin: 'usage-meter', key: 'live' } as const, {
   usd: null,
 })
 const samplesA = atom({ plugin: 'usage-meter', key: 'samples' } as const, [])
+const mineA = atom({ plugin: 'usage-meter', key: 'mine' } as const, [])
 const turnsA = atom({ plugin: 'usage-meter', key: 'turns' } as const, [])
 const currentA = atom({ plugin: 'usage-meter', key: 'current' } as const, null)
 const ctxCatsA = atom({ plugin: 'usage-meter', key: 'ctxCats' } as const, null)
@@ -68,10 +72,16 @@ let proj = ''
 const pending = new Map<string, Pending[]>()
 /** Finished turns whose share of the limits the next reading settles. */
 const unsettled = new Set<string>()
-let lastFive: Limit | undefined
-let lastSeven: Limit | undefined
 let usdAtStart: number | null = null
 const warned = new Set<string>()
+
+/**
+ * How long before the work being counted the previous reading may have been
+ * taken: a pause between prompts is still this work's. Older, the gap held
+ * idle time in which the web app or another device may have spent, so what
+ * moved then is left to 「其他」 rather than to this work.
+ */
+const SLACK_MS = 30 * MINUTE
 
 // One mutation at a time, so a reading never lands between a turn leaving
 // `current` and joining `turns`.
@@ -82,18 +92,47 @@ function serial<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 
-/** Merges this session's records with what other sessions stored, both ways. */
-async function persist($: EngineInterface): Promise<void> {
-  await serial(async () => {
+/**
+ * Every session's turns and readings: each session stores its own under
+ * `turns:<sid>` and `samples:<sid>` (0.1.0 kept them all under `turns` and
+ * `samples`). Keys that hold nothing newer than the retention go.
+ */
+async function loadAll($: EngineInterface, prune: boolean): Promise<void> {
+  const now = await $.clock.now()
+  let turns: Turn[] = []
+  let samples: Sample[] = []
+  for (const key of await $.store.keys()) {
+    const isTurns = key === 'turns' || key.startsWith('turns:')
+    const isSamples = key === 'samples' || key.startsWith('samples:')
+    if (!isTurns && !isSamples) continue
+    const value = await $.store.get(key)
+    if (isTurns) {
+      const list = asArray<Turn>(value)
+      if (prune && !list.some(t => t.t1 >= now - KEEP_MS)) await $.store.delete(key)
+      else turns = mergeTurns(turns, list, now)
+    } else {
+      const list = asArray<Sample>(value)
+      if (prune && !list.some(x => x[0] >= now - KEEP_MS)) await $.store.delete(key)
+      else samples = mergeSamples(samples, list, now)
+    }
+  }
+  await update($, turnsA, list => mergeTurns(turns, list, now))
+  await update($, samplesA, list => mergeSamples(samples, list, now))
+}
+
+/** Stores this session's own records, then takes in what other sessions stored. */
+async function persist($: EngineInterface, isEnding = false): Promise<void> {
+  try {
     const now = await $.clock.now()
-    const turns = mergeTurns(asArray<Turn>(await $.store.get('turns')), await read($, turnsA), now)
-    const samples = mergeSamples(asArray<Sample>(await $.store.get('samples')), await read($, samplesA), now)
-    await $.store.set('turns', turns)
-    await $.store.set('samples', samples)
-    await $.store.set('live', await read($, liveA))
-    await update($, turnsA, () => turns)
-    await update($, samplesA, () => samples)
-  }).catch(() => undefined)
+    await $.store.set(`turns:${sid}`, mergeTurns([], (await read($, turnsA)).filter(t => t.sid === sid), now))
+    await $.store.set(`samples:${sid}`, mergeSamples([], await read($, mineA), now))
+    const live = await read($, liveA)
+    const stored = (await $.store.get('live')) as Live | undefined
+    if (!stored || !(stored.limitsAt > live.limitsAt)) await $.store.set('live', live)
+    if (!isEnding) await loadAll($, false)
+  } catch {
+    // The next turn stores again.
+  }
 }
 
 async function showStatus($: EngineInterface): Promise<void> {
@@ -161,39 +200,52 @@ async function readContext($: EngineInterface): Promise<void> {
   await update($, ctxCatsA, () => cats)
 }
 
-/** Takes a reading: shares what the limits moved over the turns that moved them. */
+/**
+ * Takes a reading: shares what the limits moved since the newest reading any
+ * session took over this session's turns that moved them, so two sessions
+ * open at once never both claim the same points.
+ */
 async function measure($: EngineInterface, e: SessionMeasureInput): Promise<void> {
   const now = await $.clock.now()
-  const limits: Limit[] = e.rateLimits.map(r => ({ kind: r.kind, pct: r.percentUsed, resetsAt: r.resetsAt }))
+  const read5 = limitsOf(e.rateLimits)
+  const limits = read5.length ? read5 : (await read($, liveA)).limits
   const five = limits.find(l => l.kind === 'five_hour')
   const seven = limits.find(l => l.kind === 'seven_day')
 
-  if (limits.length) {
-    const d5 = moved(lastFive, five)
-    const d7 = moved(lastSeven, seven)
+  if (read5.length) {
+    const prev = (await $.store.get('last')) as Last | undefined
+    const cur = await read($, currentA)
+    const done = (await read($, turnsA)).filter(t => unsettled.has(t.id))
+    const targets = cur ? [...done, cur] : done
+    const since = Math.min(...targets.map(t => t.t0))
+    const isCovered = prev !== undefined && targets.length > 0 && prev.t >= since - SLACK_MS
+    const d5 = isCovered ? moved(prev.five, five) : 0
+    const d7 = isCovered ? moved(prev.seven, seven) : 0
     if (d5 > 0 || d7 > 0) {
-      const cur = await read($, currentA)
-      const done = (await read($, turnsA)).filter(t => unsettled.has(t.id))
-      const pool = spread(spread(cur ? [...done, cur] : done, d5, 'p5'), d7, 'p7')
-      const byId = new Map(pool.map(t => [t.id, t]))
+      const byId = new Map(spread(spread(targets, d5, 'p5'), d7, 'p7').map(t => [t.id, t]))
       if (cur) await update($, currentA, t => (t ? (byId.get(t.id) ?? t) : t))
       if (done.length) await update($, turnsA, list => list.map(t => byId.get(t.id) ?? t))
     }
     unsettled.clear()
-    lastFive = five
-    lastSeven = seven
+    const last: Last = { t: now, five: higher(prev?.five, five), seven: higher(prev?.seven, seven) }
+    await $.store.set('last', last)
   }
 
   await update($, liveA, old => ({
-    limits: limits.length ? limits : old.limits,
-    limitsAt: limits.length ? now : old.limitsAt,
+    limits,
+    limitsAt: read5.length ? now : old.limitsAt,
     ctxTokens: e.context.tokens ?? null,
     ctxWindow: e.context.window,
     ctxPct: e.context.percent ?? null,
     usd: e.cost?.usd ?? old.usd,
   }))
-  const sample: Sample = [now, five?.pct ?? null, seven?.pct ?? null, e.context.percent ?? null]
-  await update($, samplesA, list => (isNewSample(list[list.length - 1], sample) ? [...list, sample] : list))
+  const r5 = five?.resetsAt ? Date.parse(five.resetsAt) : NaN
+  const sample: Sample = [now, five?.pct ?? null, seven?.pct ?? null, e.context.percent ?? null, Number.isFinite(r5) ? r5 : null]
+  const isNew = isNewSample((await read($, mineA)).at(-1), sample)
+  if (isNew) {
+    await update($, mineA, list => [...list, sample])
+    await update($, samplesA, list => [...list, sample])
+  }
 
   for (const th of [80, 90, 100]) {
     const key = `${five?.resetsAt}:${th}`
@@ -209,20 +261,17 @@ async function start($: EngineInterface, cwd: string): Promise<void> {
   proj = cwd.split(/[\\/]/).filter(Boolean).pop() ?? cwd
   const now = await $.clock.now()
 
-  const storedTurns = asArray<Turn>(await $.store.get('turns'))
-  const storedSamples = asArray<Sample>(await $.store.get('samples'))
+  await loadAll($, true)
+  const mine = asArray<Sample>(await $.store.get(`samples:${sid}`))
+  await update($, mineA, list => mergeSamples(mine, list, now))
   const storedLive = (await $.store.get('live')) as Live | undefined
-  await update($, turnsA, list => mergeTurns(storedTurns, list, now))
-  await update($, samplesA, list => mergeSamples(storedSamples, list, now))
 
   // Until this session's first reply, show the last figures any session read.
   const usage = await $.session.usage()
   await update($, liveA, live => ({
     ...live,
     ...(storedLive && Array.isArray(storedLive.limits) ? storedLive : {}),
-    ...(usage.rateLimits.length
-      ? { limits: usage.rateLimits.map(r => ({ kind: r.kind, pct: r.percentUsed, resetsAt: r.resetsAt })), limitsAt: now }
-      : {}),
+    ...(usage.rateLimits.length ? { limits: limitsOf(usage.rateLimits), limitsAt: now } : {}),
     ctxTokens: usage.context.tokens ?? null,
     ctxWindow: usage.context.window,
     ctxPct: usage.context.percent ?? null,
@@ -264,7 +313,8 @@ export const register: Register = on => {
     const chars = ran.deny !== undefined ? ran.deny.length : (ran.text?.length ?? 0)
     pending.set(loop, [...(pending.get(loop) ?? []), { name: String(e.tool), chars }])
     if (!e.agentId) {
-      await serial(() => update($, currentA, t => (t ? { ...t, tools: t.tools + 1 } : t)))
+      // Not awaited: the result goes back to the model without waiting on it.
+      void serial(() => update($, currentA, t => (t ? { ...t, tools: t.tools + 1 } : t))).catch(() => undefined)
     }
     return ran
   }).catch(($, e, next) => next(e))
@@ -296,12 +346,13 @@ export const register: Register = on => {
   on('session.measure', async ($, e, next) => {
     await serial(() => measure($, e))
     await showStatus($)
-    void persist($)
+    // Mid-turn readings are stored with the turn; between turns, store now.
+    if ((await read($, currentA)) === null) void persist($)
     return next(e)
   })
 
   on('session.end', async ($, e, next) => {
-    await persist($)
+    await persist($, true)
     return next(e)
   })
 
@@ -404,8 +455,9 @@ export const register: Register = on => {
         live.ctxTokens !== null && live.ctxWindow ? `${fmtTok(live.ctxTokens)} / ${fmtTok(live.ctxWindow)} · ${ctx}%` : `${ctx}%`
       const mine = all.filter(t => t.sid === sid)
       const sessionTok = mine.reduce((s, t) => s + totalTok(t), 0)
-      const top = shares(all, windowStart(live.limits, 'five_hour', now), t => t.cats).slice(0, 3)
-      const topW = shares(all, windowStart(live.limits, 'five_hour', now), t => t.cats).reduce((s, x) => s + x.w, 0)
+      const inWindow = shares(all, windowStart(live.limits, 'five_hour', now), t => t.cats)
+      const top = inWindow.slice(0, 3)
+      const topW = inWindow.reduce((s, x) => s + x.w, 0)
       body = (
         <Box flexDirection="column" gap={1}>
           <Box flexDirection="column">

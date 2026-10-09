@@ -1,5 +1,11 @@
-/** One reading of the limits: when, the 5-hour %, the weekly %, the context %. */
-export type UsageMeterSample = [t: number, five: number | null, seven: number | null, ctx: number | null]
+/**
+ * One reading of the limits: when, the 5-hour %, the weekly %, the context %,
+ * and when that 5-hour window resets (absent in readings from 0.1.0).
+ */
+export type UsageMeterSample = [t: number, five: number | null, seven: number | null, ctx: number | null, r5?: number | null]
+
+/** The newest reading any session took, shared through the store. */
+export type UsageMeterLast = { t: number; five?: UsageMeterLimit; seven?: UsageMeterLimit }
 
 /** One rate-limit window as the last API response reported it. */
 export type UsageMeterLimit = { kind: string; pct: number; resetsAt?: string }
@@ -63,6 +69,8 @@ declare module 'claude-code' {
     'usage-meter': {
       live: UsageMeterLive
       samples: UsageMeterSample[]
+      /** The readings this session took, which it alone stores. */
+      mine: UsageMeterSample[]
       turns: UsageMeterTurn[]
       current: UsageMeterTurn | null
       ctxCats: UsageMeterCtxCat[] | null
