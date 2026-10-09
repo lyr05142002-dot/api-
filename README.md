@@ -51,6 +51,37 @@
 
 面板关掉以后，输入 `/usage-meter` 就能重新打开。
 
+## 桌面小挂件（Windows，屏幕顶部常驻）
+
+插件只能画在 Claude Code 里面（终端、本地会话的输入框四周），Claude App 窗口顶部和聊天界面是 App 自己的，插件画不进去。想在屏幕最上方一直看到用量，就用这个小挂件：一条半透明的深色小条，默认停在屏幕顶部正中，盖在所有窗口上面。
+
+![桌面小挂件](docs/images/widget.png)
+
+**安装**：先按下面「安装」一节装好 Claude Code 并登录一次，然后在 PowerShell 里粘贴这一行，回车：
+
+```powershell
+$p = "$env:USERPROFILE\.claude\usage-widget.ps1"; irm https://raw.githubusercontent.com/lyr05142002-dot/api-/main/widget/usage-widget.ps1 -OutFile $p; Start-Process powershell -WindowStyle Hidden -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$p`""
+```
+
+屏幕顶部会出现小挂件。右键它，勾选「开机自动启动」，以后开机就会自动出现。
+
+**它显示什么**
+- 5 小时限额、每周限额的百分比和重置时间。进度条到 80% 变黄，95% 变红。
+- 「上条建议」：usage-meter 插件给你上一条 Claude Code 消息的模型建议，一小时内有效。
+- 左边的小圆点：**绿色**是实时数据，网页、App、Claude Code 的用量都算在里面；**灰色**是暂时读不到，显示的是插件最后一次记下的数字。鼠标停在小挂件上，会显示原因和详细时间。
+
+**数据从哪来**：每 3 分钟读一次 Claude 的用量接口，也就是 Claude Code 里 `/usage` 用的那个。读的时候用的是 Claude Code 存在你电脑上的登录令牌（`.claude\.credentials.json`），只读，只发给 `api.anthropic.com`，不会发到别的地方。这个接口不是公开文档里的接口，以后可能会变；变了的话，小挂件会自动退回到插件记下的数字，圆点变灰。
+
+**用法**：按住拖动可以换位置，下次打开还在那里。右键菜单里有：立即刷新、开机自动启动、回到屏幕顶部正中、退出。
+
+**排查**：圆点一直是灰的，先看鼠标悬停时显示的原因。如果是"登录令牌已过期"，在 PowerShell 里运行一次 `claude`，它会自动刷新令牌。也可以运行下面这行，看它读到了什么：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude\usage-widget.ps1" -NoWindow
+```
+
+**卸载**：右键先取消「开机自动启动」，再点「退出」，然后删除 `%USERPROFILE%\.claude\usage-widget.ps1`。
+
 ## 安装（Windows，一步一步来）
 
 只装了 Claude 桌面 App 的电脑上没有 `claude` 命令，要先装 Claude Code 命令行，再用它装插件。下面每一步都配了截图（用户名已打码），图下方就是要复制的命令。

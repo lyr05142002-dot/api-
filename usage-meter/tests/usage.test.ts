@@ -213,7 +213,12 @@ const limits = (five: number, seven: number): SessionRateLimit[] => [
 
 /** A session with the engine's ends mocked: one tool call per turn, then an answer. */
 function session($: Engine, on: On, stored: Record<string, unknown> = {}) {
-  mock.store(on, stored)
+  // The plugin's store, readable by the test (the desktop widget reads it too).
+  const store = new Map<string, unknown>(Object.entries(stored))
+  on('store.get', (_$, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_$, e) => (store.set(e.key, JSON.parse(JSON.stringify(e.value))), { value: undefined }))
+  on('store.delete', (_$, e) => (store.delete(e.key), { value: undefined }))
+  on('store.keys', () => ({ value: [...store.keys()] }))
   const clock = mock.clock(on, { now: T0 })
   const world = { usd: 0, rateLimits: [] as SessionRateLimit[], status: [] as (string | undefined)[], toasts: [] as string[], box: '' }
   on('session.id', () => ({ value: 'abcdef1234567890' }))
@@ -248,6 +253,7 @@ function session($: Engine, on: On, stored: Record<string, unknown> = {}) {
   return {
     clock,
     world,
+    store,
     start: () => $.session.start({ cwd: '/home/me/my-app', surface: 'desktop', isInteractive: true }),
     type: (text: string) => ((world.box = text), $.prompt.fill({ text, mode: 'replace', origin: { kind: 'engine' } })),
     measure: async (five: number, seven: number) => {
@@ -376,6 +382,8 @@ describe('in a session', () => {
     await s.turn('把这句话翻译成英文', 't2', 0.02)
     await s.turn('整个项目的鉴权模块要重构，偶发的死锁问题也要排查根因', 't3', 0.5)
     await s.clock.settle()
+    // The widget on the desktop reads the latest advice from the store.
+    expect(s.store.get('advice')).toMatchObject({ tier: 'opus', fits: true })
     const band = await $.ui.mount({ plugin: 'usage-meter', surface: 'desktop', ...BAND })
     expect(await band.find({ type: 'Text', text: '这条消息建议' })).toBeDefined()
     expect(await band.find({ type: 'Text', text: 'Opus 5.5' })).toBeDefined()
