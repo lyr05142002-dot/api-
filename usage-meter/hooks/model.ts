@@ -122,10 +122,28 @@ export function withStep(t: Turn, usage: Usage, model: string, cats: Record<stri
   }
 }
 
+export function resetMs(resetsAt: string | undefined): number | null {
+  const t = resetsAt ? Date.parse(resetsAt) : NaN
+  return Number.isFinite(t) ? t : null
+}
+
+/**
+ * Whether the window reset at `b` comes after (1), before (-1) or is the same
+ * as (0) the one reset at `a`. A new window opens only after the old one
+ * resets and lasts hours, so its reset is hours later: reset times within an
+ * hour of each other, or one unknown, are one window read twice.
+ */
+export function windowOrder(a: number | null, b: number | null): -1 | 0 | 1 {
+  if (a === null || b === null || Math.abs(b - a) <= HOUR) return 0
+  return b > a ? 1 : -1
+}
+
 /** How many points a window moved between two readings; a new window starts from 0. */
 export function moved(prev: Limit | undefined, cur: Limit | undefined): number {
   if (!prev || !cur) return 0
-  if (prev.resetsAt !== cur.resetsAt) return cur.pct
+  const order = windowOrder(resetMs(prev.resetsAt), resetMs(cur.resetsAt))
+  if (order > 0) return cur.pct
+  if (order < 0) return 0 // a stale reading of the window before
   return Math.max(0, cur.pct - prev.pct)
 }
 
@@ -200,7 +218,7 @@ export function shares(turns: readonly Turn[], since: number, pick: (t: Turn) =>
 
 /** Whether `b` was read in a later 5-hour window than `a`. */
 function isRollover(a: Sample, b: Sample): boolean {
-  if (a[4] != null && b[4] != null) return b[4] > a[4]
+  if (a[4] != null && b[4] != null) return windowOrder(a[4], b[4]) > 0
   // Readings from 0.1.0 carry no reset time: only a fall by half reads as one.
   return b[1]! < a[1]! / 2
 }
@@ -241,7 +259,8 @@ export function limitsOf(rateLimits: readonly { kind: string; percentUsed: numbe
 /** The higher of two readings of one window; a later window wins. */
 export function higher(prev: Limit | undefined, cur: Limit | undefined): Limit | undefined {
   if (!prev || !cur) return cur ?? prev
-  if (prev.resetsAt !== cur.resetsAt) return (Date.parse(cur.resetsAt ?? '') || 0) >= (Date.parse(prev.resetsAt ?? '') || 0) ? cur : prev
+  const order = windowOrder(resetMs(prev.resetsAt), resetMs(cur.resetsAt))
+  if (order !== 0) return order > 0 ? cur : prev
   return cur.pct >= prev.pct ? cur : prev
 }
 

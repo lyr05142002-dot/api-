@@ -48,9 +48,16 @@ describe('attribution', () => {
     const [x, y] = spread([a, b], 4, 'p5')
     expect(x!.p5).toBe(1)
     expect(y!.p5).toBe(3)
-    expect(moved({ kind: 'five_hour', pct: 10, resetsAt: 'A' }, { kind: 'five_hour', pct: 12.5, resetsAt: 'A' })).toBe(2.5)
-    expect(moved({ kind: 'five_hour', pct: 90, resetsAt: 'A' }, { kind: 'five_hour', pct: 3, resetsAt: 'B' })).toBe(3)
+    const A = '2026-10-09T15:00:00Z'
+    const B = '2026-10-09T20:30:00Z'
+    expect(moved({ kind: 'five_hour', pct: 10, resetsAt: A }, { kind: 'five_hour', pct: 12.5, resetsAt: A })).toBe(2.5)
+    expect(moved({ kind: 'five_hour', pct: 90, resetsAt: A }, { kind: 'five_hour', pct: 3, resetsAt: B })).toBe(3)
     expect(moved(undefined, { kind: 'five_hour', pct: 3 })).toBe(0)
+    // A reset time a second off, or missing, is the same window: only the rise counts.
+    expect(moved({ kind: 'five_hour', pct: 60, resetsAt: A }, { kind: 'five_hour', pct: 61, resetsAt: '2026-10-09T15:00:01Z' })).toBe(1)
+    expect(moved({ kind: 'five_hour', pct: 60, resetsAt: A }, { kind: 'five_hour', pct: 61 })).toBe(1)
+    // A stale reading of the window before claims nothing.
+    expect(moved({ kind: 'five_hour', pct: 3, resetsAt: B }, { kind: 'five_hour', pct: 90, resetsAt: A })).toBe(0)
   })
 
   test('burn buckets add up the rises, a rollover counts what the new window shows', async () => {
@@ -82,17 +89,32 @@ describe('attribution', () => {
     expect(b).toEqual([0, 0, 1])
   })
 
-  test('a later reset time is a new window, whatever the figures', async () => {
+  test('a reset time hours later is a new window, whatever the figures', async () => {
     const b = burnBuckets(
       [
-        [0, 40, 1, null, 500],
-        [10, 30, 1, null, 900],
+        [0, 40, 1, null, 5 * 3600_000],
+        [10, 30, 1, null, 10 * 3600_000],
       ],
       0,
       20,
       2,
     )
     expect(b).toEqual([0, 30])
+  })
+
+  test('reset times a second apart are one window, so nothing is counted twice', async () => {
+    const r = 5 * 3600_000
+    const b = burnBuckets(
+      [
+        [0, 60, 1, null, r],
+        [10, 60.1, 1, null, r + 1000],
+        [20, 60.2, 1, null, r],
+      ],
+      0,
+      30,
+      3,
+    )
+    expect(b.map(x => Math.round(x * 10) / 10)).toEqual([0, 0.1, 0.1])
   })
 
   test('reset text and status line read like the app', async () => {
@@ -126,13 +148,13 @@ const limits = (five: number, seven: number): SessionRateLimit[] => [
 function session($: Engine, on: On, stored: Record<string, unknown> = {}) {
   mock.store(on, stored)
   const clock = mock.clock(on, { now: T0 })
-  const world = { usd: 0, rateLimits: [] as SessionRateLimit[], status: [] as (string | undefined)[] }
+  const world = { usd: 0, rateLimits: [] as SessionRateLimit[], status: [] as (string | undefined)[], toasts: [] as string[] }
   on('session.id', () => ({ value: 'abcdef1234567890' }))
   on('session.usage', () => ({
     value: { startedAt: T0, context: { window: 200_000, tokens: 24_000, percent: 12 }, rateLimits: world.rateLimits, cost: { usd: world.usd } },
   }))
   on('ui.status', (_$, e) => (world.status.push(e.text), { value: undefined }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_$, e) => (world.toasts.push(e.text), { value: undefined }))
   on('ui.open', () => ({ value: { isPlaced: true as const } }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   // The engine's own ends of the events the plugin observes.
@@ -222,6 +244,22 @@ describe('in a session', () => {
     const ui = await $.ui.mount({ plugin: 'usage-meter', surface: 'desktop', ...PANE })
     await ui.press({ key: 'tab-turns' })
     expect(await ui.find({ type: 'Text', text: '+3%' })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('a reading without limits does not pass stored figures off as new', async ($, on) => {
+    // The last session saw 85% of a window that has since reset.
+    const old = new Date(T0 - 3600_000).toISOString()
+    const s = session($, on, { live: { limits: [{ kind: 'five_hour', pct: 85, resetsAt: old }], limitsAt: T0 - 2 * 3600_000, ctxTokens: null, ctxWindow: null, ctxPct: null, usd: null } })
+    await s.start()
+    await $.session.measure({ context: { window: 200_000, tokens: 30_000, percent: 15 }, rateLimits: [], changed: ['context'] })
+    expect(s.world.toasts).toEqual([])
+    const ui = await $.ui.mount({ plugin: 'usage-meter', surface: 'desktop', ...PANE })
+    // The expired window reads 0%, and the context moved on.
+    expect(await ui.find({ type: 'Text', text: /已重置\s+0%/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /30k \/ 200k · 15%/ })).toBeDefined()
+    await ui.press({ key: 'tab-time' })
+    expect(await ui.find({ type: 'Text', text: /读数还少/ })).toBeDefined()
     await ui.unmount()
   })
 

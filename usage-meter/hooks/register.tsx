@@ -36,6 +36,7 @@ import {
   modelLabel,
   moved,
   newTurn,
+  resetMs,
   shares,
   spread,
   statusLine,
@@ -92,37 +93,51 @@ function serial<T>(fn: () => Promise<T>): Promise<T> {
   return run
 }
 
+/** How many sessions' records the store keeps, newest first. */
+const MAX_SESSIONS = 30
+
 /**
  * Every session's turns and readings: each session stores its own under
  * `turns:<sid>` and `samples:<sid>` (0.1.0 kept them all under `turns` and
- * `samples`). Keys that hold nothing newer than the retention go.
+ * `samples`). With `prune`, keys past the retention, or past the newest
+ * MAX_SESSIONS, go. Resolves this session's own stored readings.
  */
-async function loadAll($: EngineInterface, prune: boolean): Promise<void> {
+async function loadAll($: EngineInterface, prune: boolean): Promise<Sample[]> {
   const now = await $.clock.now()
-  let turns: Turn[] = []
-  let samples: Sample[] = []
-  for (const key of await $.store.keys()) {
-    const isTurns = key === 'turns' || key.startsWith('turns:')
-    const isSamples = key === 'samples' || key.startsWith('samples:')
-    if (!isTurns && !isSamples) continue
-    const value = await $.store.get(key)
-    if (isTurns) {
-      const list = asArray<Turn>(value)
-      if (prune && !list.some(t => t.t1 >= now - KEEP_MS)) await $.store.delete(key)
-      else turns = mergeTurns(turns, list, now)
+  const keys = (await $.store.keys()).filter(k => /^(turns|samples)(:|$)/.test(k))
+  const values = await Promise.all(keys.map(k => $.store.get(k)))
+  const turnLists: { key: string; list: Turn[]; newest: number }[] = []
+  const sampleLists: { key: string; list: Sample[]; newest: number }[] = []
+  keys.forEach((key, i) => {
+    if (key.startsWith('turns')) {
+      const list = asArray<Turn>(values[i])
+      turnLists.push({ key, list, newest: Math.max(0, ...list.map(t => t.t1)) })
     } else {
-      const list = asArray<Sample>(value)
-      if (prune && !list.some(x => x[0] >= now - KEEP_MS)) await $.store.delete(key)
-      else samples = mergeSamples(samples, list, now)
+      const list = asArray<Sample>(values[i])
+      sampleLists.push({ key, list, newest: Math.max(0, ...list.map(x => x[0])) })
     }
+  })
+  const keep = <T,>(lists: { key: string; list: T[]; newest: number }[]) => {
+    const fresh = lists.filter(l => l.newest >= now - KEEP_MS).sort((x, y) => y.newest - x.newest)
+    const kept = prune ? fresh.slice(0, MAX_SESSIONS) : fresh
+    return { kept, dropped: prune ? lists.filter(l => !kept.includes(l)) : [] }
   }
-  await update($, turnsA, list => mergeTurns(turns, list, now))
-  await update($, samplesA, list => mergeSamples(samples, list, now))
+  const turns = keep(turnLists)
+  const samples = keep(sampleLists)
+  await Promise.all([...turns.dropped, ...samples.dropped].map(l => $.store.delete(l.key)))
+  const allTurns = mergeTurns([], turns.kept.flatMap(l => l.list), now)
+  const allSamples = mergeSamples([], samples.kept.flatMap(l => l.list), now)
+  await update($, turnsA, list => mergeTurns(allTurns, list, now))
+  await update($, samplesA, list => mergeSamples(allSamples, list, now))
+  return samples.kept.find(l => l.key === `samples:${sid}`)?.list ?? []
 }
 
+// Saves one at a time, so an older save never lands after a newer one.
+let saving: Promise<unknown> = Promise.resolve()
+
 /** Stores this session's own records, then takes in what other sessions stored. */
-async function persist($: EngineInterface, isEnding = false): Promise<void> {
-  try {
+function persist($: EngineInterface, isEnding = false): Promise<void> {
+  const run = saving.then(async () => {
     const now = await $.clock.now()
     await $.store.set(`turns:${sid}`, mergeTurns([], (await read($, turnsA)).filter(t => t.sid === sid), now))
     await $.store.set(`samples:${sid}`, mergeSamples([], await read($, mineA), now))
@@ -130,9 +145,10 @@ async function persist($: EngineInterface, isEnding = false): Promise<void> {
     const stored = (await $.store.get('live')) as Live | undefined
     if (!stored || !(stored.limitsAt > live.limitsAt)) await $.store.set('live', live)
     if (!isEnding) await loadAll($, false)
-  } catch {
-    // The next turn stores again.
-  }
+  })
+  // A failed save is retried by the next turn's.
+  saving = run.catch(() => undefined)
+  return run.catch(() => undefined)
 }
 
 async function showStatus($: EngineInterface): Promise<void> {
@@ -207,42 +223,51 @@ async function readContext($: EngineInterface): Promise<void> {
  */
 async function measure($: EngineInterface, e: SessionMeasureInput): Promise<void> {
   const now = await $.clock.now()
-  const read5 = limitsOf(e.rateLimits)
-  const limits = read5.length ? read5 : (await read($, liveA)).limits
+  const limits = limitsOf(e.rateLimits)
+  if (limits.length === 0) {
+    // No reading of the limits yet: the context alone moved.
+    await update($, liveA, old => ({
+      ...old,
+      ctxTokens: e.context.tokens ?? null,
+      ctxWindow: e.context.window,
+      ctxPct: e.context.percent ?? null,
+      usd: e.cost?.usd ?? old.usd,
+    }))
+    return
+  }
   const five = limits.find(l => l.kind === 'five_hour')
   const seven = limits.find(l => l.kind === 'seven_day')
 
-  if (read5.length) {
-    const prev = (await $.store.get('last')) as Last | undefined
-    const cur = await read($, currentA)
-    const done = (await read($, turnsA)).filter(t => unsettled.has(t.id))
-    const targets = cur ? [...done, cur] : done
-    const since = Math.min(...targets.map(t => t.t0))
-    const isCovered = prev !== undefined && targets.length > 0 && prev.t >= since - SLACK_MS
-    const d5 = isCovered ? moved(prev.five, five) : 0
-    const d7 = isCovered ? moved(prev.seven, seven) : 0
-    if (d5 > 0 || d7 > 0) {
-      const byId = new Map(spread(spread(targets, d5, 'p5'), d7, 'p7').map(t => [t.id, t]))
-      if (cur) await update($, currentA, t => (t ? (byId.get(t.id) ?? t) : t))
-      if (done.length) await update($, turnsA, list => list.map(t => byId.get(t.id) ?? t))
-    }
-    unsettled.clear()
-    const last: Last = { t: now, five: higher(prev?.five, five), seven: higher(prev?.seven, seven) }
-    await $.store.set('last', last)
+  const prev = (await $.store.get('last')) as Last | undefined
+  const cur = await read($, currentA)
+  const done = (await read($, turnsA)).filter(t => unsettled.has(t.id))
+  const targets = cur ? [...done, cur] : done
+  // Claim the reading first, so a session reading a moment later compares
+  // against it. A reading with nothing to give points to claims nothing: what
+  // moved before it stays for the session whose turns spent it.
+  if (targets.length > 0 || !prev) {
+    await $.store.set('last', { t: now, five: higher(prev?.five, five), seven: higher(prev?.seven, seven) } satisfies Last)
   }
+  const isCovered = prev !== undefined && targets.length > 0 && prev.t >= Math.min(...targets.map(t => t.t0)) - SLACK_MS
+  const d5 = isCovered ? moved(prev.five, five) : 0
+  const d7 = isCovered ? moved(prev.seven, seven) : 0
+  if (d5 > 0 || d7 > 0) {
+    const byId = new Map(spread(spread(targets, d5, 'p5'), d7, 'p7').map(t => [t.id, t]))
+    if (cur) await update($, currentA, t => (t ? (byId.get(t.id) ?? t) : t))
+    if (done.length) await update($, turnsA, list => list.map(t => byId.get(t.id) ?? t))
+  }
+  unsettled.clear()
 
   await update($, liveA, old => ({
     limits,
-    limitsAt: read5.length ? now : old.limitsAt,
+    limitsAt: now,
     ctxTokens: e.context.tokens ?? null,
     ctxWindow: e.context.window,
     ctxPct: e.context.percent ?? null,
     usd: e.cost?.usd ?? old.usd,
   }))
-  const r5 = five?.resetsAt ? Date.parse(five.resetsAt) : NaN
-  const sample: Sample = [now, five?.pct ?? null, seven?.pct ?? null, e.context.percent ?? null, Number.isFinite(r5) ? r5 : null]
-  const isNew = isNewSample((await read($, mineA)).at(-1), sample)
-  if (isNew) {
+  const sample: Sample = [now, five?.pct ?? null, seven?.pct ?? null, e.context.percent ?? null, resetMs(five?.resetsAt)]
+  if (isNewSample((await read($, mineA)).at(-1), sample)) {
     await update($, mineA, list => [...list, sample])
     await update($, samplesA, list => [...list, sample])
   }
@@ -261,8 +286,7 @@ async function start($: EngineInterface, cwd: string): Promise<void> {
   proj = cwd.split(/[\\/]/).filter(Boolean).pop() ?? cwd
   const now = await $.clock.now()
 
-  await loadAll($, true)
-  const mine = asArray<Sample>(await $.store.get(`samples:${sid}`))
+  const mine = await loadAll($, true)
   await update($, mineA, list => mergeSamples(mine, list, now))
   const storedLive = (await $.store.get('live')) as Live | undefined
 
